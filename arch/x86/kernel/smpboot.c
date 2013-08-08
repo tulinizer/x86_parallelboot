@@ -931,6 +931,64 @@ int native_cpu_up(unsigned int cpu, struct task_struct *tidle)
 	return 0;
 }
 
+int native_cpu_parallel_up(unsigned int cpu, struct task_struct *tidle)
+{
+	int apicid = apic->cpu_present_to_apicid(cpu);
+	unsigned long flags;
+	int err;
+
+	WARN_ON(irqs_disabled());
+
+	pr_debug("++++++++++++++++++++=_---CPU UP  %u\n", cpu);
+
+	if (apicid == BAD_APICID ||
+	    !physid_isset(apicid, phys_cpu_present_map) ||
+	    !apic->apic_id_valid(apicid)) {
+		pr_err("%s: bad cpu %d\n", __func__, cpu);
+		return -EINVAL;
+	}
+
+	/*
+	 * Already booted CPU?
+	 */
+	if (cpumask_test_cpu(cpu, cpu_callin_mask)) {
+		pr_debug("do_boot_cpu %d Already started\n", cpu);
+		return -ENOSYS;
+	}
+
+	/*
+	 * Save current MTRR state in case it was changed since early boot
+	 * (e.g. by the ACPI SMI) to initialize new CPUs with MTRRs in sync:
+	 */
+	mtrr_save_state();
+
+	per_cpu(cpu_state, cpu) = CPU_UP_PREPARE;
+
+	/* the FPU context is blank, nobody can own it */
+	__cpu_disable_lazy_restore(cpu);
+
+	err = do_boot_cpu(apicid, cpu, tidle);
+	if (err) {
+		pr_debug("do_boot_cpu failed %d\n", err);
+		return -EIO;
+	}
+
+	/*
+	 * Check TSC synchronization with the AP (keep irqs disabled
+	 * while doing so):
+	 */
+	local_irq_save(flags);
+	check_tsc_sync_source(cpu);
+	local_irq_restore(flags);
+
+	while (!cpu_online(cpu)) {
+		cpu_relax();
+		touch_nmi_watchdog();
+	}
+
+	return 0;
+}
+
 /**
  * arch_disable_smp_support() - disables SMP support for x86 at runtime
  */
