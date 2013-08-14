@@ -383,10 +383,6 @@ static int _cpu_up(unsigned int cpu, int tasks_frozen)
 		goto out;
 	}
 
-	ret = smpboot_create_threads(cpu);
-	if (ret)
-		goto out;
-
 	ret = __cpu_notify(CPU_UP_PREPARE | mod, hcpu, -1, &nr_calls);
 	if (ret) {
 		nr_calls--;
@@ -400,6 +396,10 @@ static int _cpu_up(unsigned int cpu, int tasks_frozen)
 	if (ret != 0)
 		goto out_notify;
 	BUG_ON(!cpu_online(cpu));
+
+	ret = smpboot_create_threads(cpu);
+	if (ret)
+		goto out;
 
 	/* Wake the per cpu threads */
 	smpboot_unpark_threads(cpu);
