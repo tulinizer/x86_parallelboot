@@ -851,16 +851,10 @@ static int do_boot_cpu(int apicid, int cpu, struct task_struct *idle)
  * Returns zero if CPU booted OK, else error code from
  * ->wakeup_secondary_cpu.
  */
-static int do_parallel_boot_cpu(int apicid, int cpu, struct task_struct *idle)
+static int do_parallel_boot_cpu(int apicid, int cpu, struct task_struct *idle, int cpu0_nmi_registered)
 {
-	volatile u32 *trampoline_status =
-		(volatile u32 *) __va(real_mode_header->trampoline_status);
 	/* start_ip had better be page-aligned! */
 	unsigned long start_ip = real_mode_header->trampoline_start;
-
-	unsigned long boot_error = 0;
-	int timeout;
-	int cpu0_nmi_registered = 0;
 
 	/* Just in case we booted with a single CPU. */
 	alternatives_enable_smp();
@@ -914,82 +908,10 @@ static int do_parallel_boot_cpu(int apicid, int cpu, struct task_struct *idle)
 	 * - Use an INIT boot APIC message for APs or NMI for BSP.
 	 */
 	if (apic->wakeup_secondary_cpu)
-		boot_error = apic->wakeup_secondary_cpu(apicid, start_ip);
+		return (apic->wakeup_secondary_cpu(apicid, start_ip));
 	else
-		boot_error = wakeup_cpu_via_init_nmi(cpu, start_ip, apicid,
+		return wakeup_cpu_via_init_nmi(cpu, start_ip, apicid,
 						     &cpu0_nmi_registered);
-
-	if (!boot_error) {
-		/*
-		 * allow APs to start initializing.
-		 */
-		pr_debug("Before Callout %d\n", cpu);
-		cpumask_set_cpu(cpu, cpu_callout_mask);
-		pr_debug("After Callout %d\n", cpu);
-
-		/*
-		 * Wait 5s total for a response
-		 */
-		for (timeout = 0; timeout < 50000; timeout++) {
-			if (cpumask_test_cpu(cpu, cpu_callin_mask))
-				break;	/* It has booted */
-			udelay(100);
-			/*
-			 * Allow other tasks to run while we wait for the
-			 * AP to come online. This also gives a chance
-			 * for the MTRR work(triggered by the AP coming online)
-			 * to be completed in the stop machine context.
-			 */
-			schedule();
-		}
-
-		if (cpumask_test_cpu(cpu, cpu_callin_mask)) {
-			print_cpu_msr(&cpu_data(cpu));
-			pr_debug("CPU%d: has booted.\n", cpu);
-		} else {
-			boot_error = 1;
-			if (*trampoline_status == 0xA5A5A5A5)
-				/* trampoline started but...? */
-				pr_err("CPU%d: Stuck ??\n", cpu);
-			else
-				/* trampoline code not run */
-				pr_err("CPU%d: Not responding\n", cpu);
-			if (apic->inquire_remote_apic)
-				apic->inquire_remote_apic(apicid);
-		}
-	}
-
-	if (boot_error) {
-		/* Try to put things back the way they were before ... */
-		numa_remove_cpu(cpu); /* was set by numa_add_cpu */
-
-		/* was set by do_boot_cpu() */
-		cpumask_clear_cpu(cpu, cpu_callout_mask);
-
-		/* was set by cpu_init() */
-		cpumask_clear_cpu(cpu, cpu_initialized_mask);
-
-		set_cpu_present(cpu, false);
-		per_cpu(x86_cpu_to_apicid, cpu) = BAD_APICID;
-	}
-
-	/* mark "stuck" area as not stuck */
-	*trampoline_status = 0;
-
-	if (get_uv_system_type() != UV_NON_UNIQUE_APIC) {
-		/*
-		 * Cleanup possible dangling ends...
-		 */
-		smpboot_restore_warm_reset_vector();
-	}
-	/*
-	 * Clean up the nmi handler. Do this after the callin and callout sync
-	 * to avoid impact of possible long unregister time.
-	 */
-	if (cpu0_nmi_registered)
-		unregister_nmi_handler(NMI_LOCAL, "wake_cpu0");
-
-	return boot_error;
 }
 
 int native_cpu_up(unsigned int cpu, struct task_struct *tidle)
@@ -1054,8 +976,9 @@ int native_cpu_parallel_up(unsigned int cpu, struct task_struct *tidle)
 {
 	int apicid = apic->cpu_present_to_apicid(cpu);
 	unsigned long flags, send_status = 0;
-	int err;
+	int boot_error, timeout;
 	static int i = 0;
+	int cpu0_nmi_registered = 0;
 
 	WARN_ON(irqs_disabled());
 
@@ -1115,9 +1038,71 @@ int native_cpu_parallel_up(unsigned int cpu, struct task_struct *tidle)
 	/* the FPU context is blank, nobody can own it */
 	__cpu_disable_lazy_restore(cpu);
 
-	err = do_boot_cpu(apicid, cpu, tidle);
-	if (err) {
-		pr_debug("do_boot_cpu failed %d\n", err);
+	boot_error = do_parallel_boot_cpu(apicid, cpu, tidle, cpu0_nmi_registered);
+
+	if (!boot_error) {
+		/*
+		 * allow APs to start initializing.
+		 */
+		pr_debug("Before Callout %d\n", cpu);
+		cpumask_set_cpu(cpu, cpu_callout_mask);
+		pr_debug("After Callout %d\n", cpu);
+
+		/*
+		 * Wait 5s total for a response
+		 */
+		for (timeout = 0; timeout < 50000; timeout++) {
+			if (cpumask_test_cpu(cpu, cpu_callin_mask))
+				break;	/* It has booted */
+			udelay(100);
+			/*
+			 * Allow other tasks to run while we wait for the
+			 * AP to come online. This also gives a chance
+			 * for the MTRR work(triggered by the AP coming online)
+			 * to be completed in the stop machine context.
+			 */
+			schedule();
+		}
+
+		if (cpumask_test_cpu(cpu, cpu_callin_mask)) {
+			print_cpu_msr(&cpu_data(cpu));
+			pr_debug("CPU%d: has booted.\n", cpu);
+		} else {
+			boot_error = 1;
+			if (apic->inquire_remote_apic)
+				apic->inquire_remote_apic(apicid);
+		}
+	}
+
+	if (boot_error) {
+		/* Try to put things back the way they were before ... */
+		numa_remove_cpu(cpu); /* was set by numa_add_cpu */
+
+		/* was set by do_boot_cpu() */
+		cpumask_clear_cpu(cpu, cpu_callout_mask);
+
+		/* was set by cpu_init() */
+		cpumask_clear_cpu(cpu, cpu_initialized_mask);
+
+		set_cpu_present(cpu, false);
+		per_cpu(x86_cpu_to_apicid, cpu) = BAD_APICID;
+	}
+
+	if (get_uv_system_type() != UV_NON_UNIQUE_APIC) {
+		/*
+		 * Cleanup possible dangling ends...
+		 */
+		smpboot_restore_warm_reset_vector();
+	}
+	/*
+	 * Clean up the nmi handler. Do this after the callin and callout sync
+	 * to avoid impact of possible long unregister time.
+	 */
+	if (cpu0_nmi_registered)
+		unregister_nmi_handler(NMI_LOCAL, "wake_cpu0");
+
+	if (boot_error) {
+		pr_debug("do_boot_cpu failed %d\n", boot_error);
 		return -EIO;
 	}
 
