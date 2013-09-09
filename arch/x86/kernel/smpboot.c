@@ -550,34 +550,6 @@ wakeup_secondary_cpu_via_init(int phys_apicid, unsigned long start_eip)
 		apic_read(APIC_ESR);
 	}
 
-	pr_debug("Asserting INIT\n");
-
-	/*
-	 * Turn INIT on target chip
-	 */
-	/*
-	 * Send IPI
-	 */
-	apic_icr_write(APIC_INT_LEVELTRIG | APIC_INT_ASSERT | APIC_DM_INIT,
-		       phys_apicid);
-
-	pr_debug("Waiting for send to finish...\n");
-	send_status = safe_apic_wait_icr_idle();
-
-	mdelay(10);
-
-	pr_debug("Deasserting INIT\n");
-
-	/* Target chip */
-	/* Send IPI */
-	apic_icr_write(APIC_INT_LEVELTRIG | APIC_DM_INIT, phys_apicid);
-
-	pr_debug("Waiting for send to finish...\n");
-	send_status = safe_apic_wait_icr_idle();
-
-	mb();
-	atomic_set(&init_deasserted, 1);
-
 	/*
 	 * Should we send STARTUP IPIs ?
 	 *
@@ -873,6 +845,153 @@ static int do_boot_cpu(int apicid, int cpu, struct task_struct *idle)
 	return boot_error;
 }
 
+/*
+ * NOTE - on most systems this is a PHYSICAL apic ID, but on multiquad
+ * (ie clustered apic addressing mode), this is a LOGICAL apic ID.
+ * Returns zero if CPU booted OK, else error code from
+ * ->wakeup_secondary_cpu.
+ */
+static int do_parallel_boot_cpu(int apicid, int cpu, struct task_struct *idle)
+{
+	volatile u32 *trampoline_status =
+		(volatile u32 *) __va(real_mode_header->trampoline_status);
+	/* start_ip had better be page-aligned! */
+	unsigned long start_ip = real_mode_header->trampoline_start;
+
+	unsigned long boot_error = 0;
+	int timeout;
+	int cpu0_nmi_registered = 0;
+
+	/* Just in case we booted with a single CPU. */
+	alternatives_enable_smp();
+
+	idle->thread.sp = (unsigned long) (((struct pt_regs *)
+			  (THREAD_SIZE +  task_stack_page(idle))) - 1);
+	per_cpu(current_task, cpu) = idle;
+
+#ifdef CONFIG_X86_32
+	/* Stack for startup_32 can be just as for start_secondary onwards */
+	irq_ctx_init(cpu);
+#else
+	clear_tsk_thread_flag(idle, TIF_FORK);
+	initial_gs = per_cpu_offset(cpu);
+	per_cpu(kernel_stack, cpu) =
+		(unsigned long)task_stack_page(idle) -
+		KERNEL_STACK_OFFSET + THREAD_SIZE;
+#endif
+	early_gdt_descr.address = (unsigned long)get_cpu_gdt_table(cpu);
+	initial_code = (unsigned long)start_secondary;
+	stack_start  = idle->thread.sp;
+
+	/* So we see what's up */
+	announce_cpu(cpu, apicid);
+
+	/*
+	 * This grunge runs the startup process for
+	 * the targeted processor.
+	 */
+
+	atomic_set(&init_deasserted, 0);
+
+	if (get_uv_system_type() != UV_NON_UNIQUE_APIC) {
+
+		pr_debug("Setting warm reset code and vector.\n");
+
+		smpboot_setup_warm_reset_vector(start_ip);
+		/*
+		 * Be paranoid about clearing APIC errors.
+		*/
+		if (APIC_INTEGRATED(apic_version[boot_cpu_physical_apicid])) {
+			apic_write(APIC_ESR, 0);
+			apic_read(APIC_ESR);
+		}
+	}
+
+	/*
+	 * Wake up a CPU in difference cases:
+	 * - Use the method in the APIC driver if it's defined
+	 * Otherwise,
+	 * - Use an INIT boot APIC message for APs or NMI for BSP.
+	 */
+	if (apic->wakeup_secondary_cpu)
+		boot_error = apic->wakeup_secondary_cpu(apicid, start_ip);
+	else
+		boot_error = wakeup_cpu_via_init_nmi(cpu, start_ip, apicid,
+						     &cpu0_nmi_registered);
+
+	if (!boot_error) {
+		/*
+		 * allow APs to start initializing.
+		 */
+		pr_debug("Before Callout %d\n", cpu);
+		cpumask_set_cpu(cpu, cpu_callout_mask);
+		pr_debug("After Callout %d\n", cpu);
+
+		/*
+		 * Wait 5s total for a response
+		 */
+		for (timeout = 0; timeout < 50000; timeout++) {
+			if (cpumask_test_cpu(cpu, cpu_callin_mask))
+				break;	/* It has booted */
+			udelay(100);
+			/*
+			 * Allow other tasks to run while we wait for the
+			 * AP to come online. This also gives a chance
+			 * for the MTRR work(triggered by the AP coming online)
+			 * to be completed in the stop machine context.
+			 */
+			schedule();
+		}
+
+		if (cpumask_test_cpu(cpu, cpu_callin_mask)) {
+			print_cpu_msr(&cpu_data(cpu));
+			pr_debug("CPU%d: has booted.\n", cpu);
+		} else {
+			boot_error = 1;
+			if (*trampoline_status == 0xA5A5A5A5)
+				/* trampoline started but...? */
+				pr_err("CPU%d: Stuck ??\n", cpu);
+			else
+				/* trampoline code not run */
+				pr_err("CPU%d: Not responding\n", cpu);
+			if (apic->inquire_remote_apic)
+				apic->inquire_remote_apic(apicid);
+		}
+	}
+
+	if (boot_error) {
+		/* Try to put things back the way they were before ... */
+		numa_remove_cpu(cpu); /* was set by numa_add_cpu */
+
+		/* was set by do_boot_cpu() */
+		cpumask_clear_cpu(cpu, cpu_callout_mask);
+
+		/* was set by cpu_init() */
+		cpumask_clear_cpu(cpu, cpu_initialized_mask);
+
+		set_cpu_present(cpu, false);
+		per_cpu(x86_cpu_to_apicid, cpu) = BAD_APICID;
+	}
+
+	/* mark "stuck" area as not stuck */
+	*trampoline_status = 0;
+
+	if (get_uv_system_type() != UV_NON_UNIQUE_APIC) {
+		/*
+		 * Cleanup possible dangling ends...
+		 */
+		smpboot_restore_warm_reset_vector();
+	}
+	/*
+	 * Clean up the nmi handler. Do this after the callin and callout sync
+	 * to avoid impact of possible long unregister time.
+	 */
+	if (cpu0_nmi_registered)
+		unregister_nmi_handler(NMI_LOCAL, "wake_cpu0");
+
+	return boot_error;
+}
+
 int native_cpu_up(unsigned int cpu, struct task_struct *tidle)
 {
 	int apicid = apic->cpu_present_to_apicid(cpu);
@@ -934,8 +1053,9 @@ int native_cpu_up(unsigned int cpu, struct task_struct *tidle)
 int native_cpu_parallel_up(unsigned int cpu, struct task_struct *tidle)
 {
 	int apicid = apic->cpu_present_to_apicid(cpu);
-	unsigned long flags;
+	unsigned long flags, send_status = 0;
 	int err;
+	static int i = 0;
 
 	WARN_ON(irqs_disabled());
 
@@ -946,6 +1066,34 @@ int native_cpu_parallel_up(unsigned int cpu, struct task_struct *tidle)
 	    !apic->apic_id_valid(apicid)) {
 		pr_err("%s: bad cpu %d\n", __func__, cpu);
 		return -EINVAL;
+	}
+
+	if (i == 0) {
+		/*
+		 * Turn INIT on target chip -- this is a broadcast to "all but self"
+		 */
+		/*
+		 * Send IPI
+		 */
+		apic_icr_write(APIC_INT_LEVELTRIG | APIC_INT_ASSERT | APIC_DM_INIT | APIC_DEST_ALLBUT, 0);
+
+		pr_debug("Waiting for send to finish...\n");
+		send_status = safe_apic_wait_icr_idle();
+
+		mdelay(10);
+
+		pr_debug("Deasserting INIT\n");
+
+		/* Target chip */
+		/* Send IPI */
+		apic_icr_write(APIC_INT_LEVELTRIG | APIC_DM_INIT, 0);
+
+		pr_debug("Waiting for send to finish...\n");
+		send_status = safe_apic_wait_icr_idle();
+
+		mb();
+		atomic_set(&init_deasserted, 1);
+		i++;
 	}
 
 	/*
