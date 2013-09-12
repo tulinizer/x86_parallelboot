@@ -972,32 +972,40 @@ int native_cpu_up(unsigned int cpu, struct task_struct *tidle)
 	return 0;
 }
 
-int native_cpu_parallel_up(unsigned int cpu, struct task_struct *tidle)
+static RAW_NOTIFIER_HEAD(cpu_chain);
+
+static int __cpu_notify(unsigned long val, void *v, int nr_to_call,
+			int *nr_calls)
 {
-	int apicid = apic->cpu_present_to_apicid(cpu);
+	int ret;
+
+	ret = __raw_notifier_call_chain(&cpu_chain, val, v, nr_to_call,
+					nr_calls);
+
+	return notifier_to_errno(ret);
+}
+
+int __cpuinit native_cpu_parallel_up(unsigned int cpu, struct task_struct *tidle)
+{
+	int apicid;
 	unsigned long flags, send_status = 0;
-	int boot_error, timeout;
-	static int i = 0;
+	int timeout;
 	int cpu0_nmi_registered = 0;
+	int boot_error[4] = {0, 0, 0, 0};
+	int i = 0;
+	int nr_calls = 0;
+	unsigned long mod = 0 ? CPU_TASKS_FROZEN : 0;
 
 	WARN_ON(irqs_disabled());
 
 	pr_debug("++++++++++++++++++++=_---CPU UP  %u\n", cpu);
 
-	if (apicid == BAD_APICID ||
-	    !physid_isset(apicid, phys_cpu_present_map) ||
-	    !apic->apic_id_valid(apicid)) {
-		pr_err("%s: bad cpu %d\n", __func__, cpu);
-		return -EINVAL;
-	}
-
-	if (i == 0) {
-		/*
-		 * Turn INIT on target chip -- this is a broadcast to "all but self"
-		 */
-		/*
-		 * Send IPI
-		 */
+		 /*
+			* Turn INIT on target chip -- this is a broadcast to "all but self"
+			*/
+		   /*
+			* Send IPI
+			*/
 		apic_icr_write(APIC_INT_LEVELTRIG | APIC_INT_ASSERT | APIC_DM_INIT | APIC_DEST_ALLBUT, 0);
 
 		pr_debug("Waiting for send to finish...\n");
@@ -1016,107 +1024,130 @@ int native_cpu_parallel_up(unsigned int cpu, struct task_struct *tidle)
 
 		mb();
 		atomic_set(&init_deasserted, 1);
-		i++;
-	}
 
-	/*
-	 * Already booted CPU?
-	 */
-	if (cpumask_test_cpu(cpu, cpu_callin_mask)) {
-		pr_debug("do_boot_cpu %d Already started\n", cpu);
-		return -ENOSYS;
-	}
 
-	/*
-	 * Save current MTRR state in case it was changed since early boot
-	 * (e.g. by the ACPI SMI) to initialize new CPUs with MTRRs in sync:
-	 */
-	mtrr_save_state();
+	for_each_present_cpu(cpu) {
+		apicid = apic->cpu_present_to_apicid(cpu);
 
-	per_cpu(cpu_state, cpu) = CPU_UP_PREPARE;
-
-	/* the FPU context is blank, nobody can own it */
-	__cpu_disable_lazy_restore(cpu);
-
-	boot_error = do_parallel_boot_cpu(apicid, cpu, tidle, cpu0_nmi_registered);
-
-	if (!boot_error) {
-		/*
-		 * allow APs to start initializing.
-		 */
-		pr_debug("Before Callout %d\n", cpu);
-		cpumask_set_cpu(cpu, cpu_callout_mask);
-		pr_debug("After Callout %d\n", cpu);
-
-		/*
-		 * Wait 5s total for a response
-		 */
-		for (timeout = 0; timeout < 50000; timeout++) {
-			if (cpumask_test_cpu(cpu, cpu_callin_mask))
-				break;	/* It has booted */
-			udelay(100);
-			/*
-			 * Allow other tasks to run while we wait for the
-			 * AP to come online. This also gives a chance
-			 * for the MTRR work(triggered by the AP coming online)
-			 * to be completed in the stop machine context.
-			 */
-			schedule();
+		if (apicid == BAD_APICID ||
+			!physid_isset(apicid, phys_cpu_present_map) ||
+			!apic->apic_id_valid(apicid)) {
+			pr_err("%s: bad cpu %d\n", __func__, cpu);
+			boot_error[i] = -EINVAL;
 		}
+
+		/*
+		 * Already booted CPU?
+		 */
+		else if (cpumask_test_cpu(cpu, cpu_callin_mask)) {
+			pr_debug("do_boot_cpu %d Already started\n", cpu);
+			boot_error[i] = -ENOSYS;
+		}
+
+		else {
+			/*
+			 * Save current MTRR state in case it was changed since early boot
+			 * (e.g. by the ACPI SMI) to initialize new CPUs with MTRRs in sync:
+			 */
+			mtrr_save_state();
+
+			per_cpu(cpu_state, cpu) = CPU_UP_PREPARE;
+
+			/* the FPU context is blank, nobody can own it */
+			__cpu_disable_lazy_restore(cpu);
+
+			boot_error[i] = do_parallel_boot_cpu(apicid, cpu, tidle, cpu0_nmi_registered);
+
+			/*
+			* allow APs to start initializing.
+			*/
+			pr_debug("Before Callout %d\n", cpu);
+			cpumask_set_cpu(cpu, cpu_callout_mask);
+			pr_debug("After Callout %d\n", cpu);
+
+			i++;
+		}
+	}
+
+	i = 0;
+	for_each_present_cpu(cpu) {
+		void *hcpu = (void *)(long)cpu;
+		apicid = apic->cpu_present_to_apicid(cpu);
+
+		if (!boot_error[i]) {
+			/*
+			 * Wait 5s total for a response
+			 */
+			for (timeout = 0; timeout < 50000; timeout++) {
+				if (cpumask_test_cpu(cpu, cpu_callin_mask))
+					break;	/* It has booted */
+				udelay(100);
+				/*
+				 * Allow other tasks to run while we wait for the
+				 * AP to come online. This also gives a chance
+				 * for the MTRR work(triggered by the AP coming online)
+				 * to be completed in the stop machine context.
+				 */
+				schedule();
+			}
 
 		if (cpumask_test_cpu(cpu, cpu_callin_mask)) {
 			print_cpu_msr(&cpu_data(cpu));
 			pr_debug("CPU%d: has booted.\n", cpu);
 		} else {
-			boot_error = 1;
+			boot_error[i] = 1;
 			if (apic->inquire_remote_apic)
 				apic->inquire_remote_apic(apicid);
+			}
 		}
-	}
 
-	if (boot_error) {
-		/* Try to put things back the way they were before ... */
-		numa_remove_cpu(cpu); /* was set by numa_add_cpu */
+		if (boot_error[i]) {
+			/* Try to put things back the way they were before ... */
+			numa_remove_cpu(cpu); /* was set by numa_add_cpu */
 
-		/* was set by do_boot_cpu() */
-		cpumask_clear_cpu(cpu, cpu_callout_mask);
+			/* was set by do_boot_cpu() */
+			cpumask_clear_cpu(cpu, cpu_callout_mask);
 
-		/* was set by cpu_init() */
-		cpumask_clear_cpu(cpu, cpu_initialized_mask);
+			/* was set by cpu_init() */
+			cpumask_clear_cpu(cpu, cpu_initialized_mask);
 
-		set_cpu_present(cpu, false);
-		per_cpu(x86_cpu_to_apicid, cpu) = BAD_APICID;
-	}
+			set_cpu_present(cpu, false);
+			per_cpu(x86_cpu_to_apicid, cpu) = BAD_APICID;
+		}
 
-	if (get_uv_system_type() != UV_NON_UNIQUE_APIC) {
+		if (get_uv_system_type() != UV_NON_UNIQUE_APIC) {
+			/*
+			 * Cleanup possible dangling ends...
+			 */
+			smpboot_restore_warm_reset_vector();
+		}
 		/*
-		 * Cleanup possible dangling ends...
+		 * Clean up the nmi handler. Do this after the callin and callout sync
+		 * to avoid impact of possible long unregister time.
 		 */
-		smpboot_restore_warm_reset_vector();
-	}
-	/*
-	 * Clean up the nmi handler. Do this after the callin and callout sync
-	 * to avoid impact of possible long unregister time.
-	 */
-	if (cpu0_nmi_registered)
-		unregister_nmi_handler(NMI_LOCAL, "wake_cpu0");
+		if (cpu0_nmi_registered)
+			unregister_nmi_handler(NMI_LOCAL, "wake_cpu0");
 
-	if (boot_error) {
-		pr_debug("do_boot_cpu failed %d\n", boot_error);
-		return -EIO;
-	}
+		if (boot_error[i]) {
+			pr_debug("do_boot_cpu failed %d\n", boot_error[i]);
+			boot_error[i] = -EIO;
+			__cpu_notify(CPU_UP_CANCELED | mod, hcpu, nr_calls, NULL);
+		} else {
+			/*
+			 * Check TSC synchronization with the AP (keep irqs disabled
+			 * while doing so):
+			 */
+			local_irq_save(flags);
+			check_tsc_sync_source(cpu);
+			local_irq_restore(flags);
 
-	/*
-	 * Check TSC synchronization with the AP (keep irqs disabled
-	 * while doing so):
-	 */
-	local_irq_save(flags);
-	check_tsc_sync_source(cpu);
-	local_irq_restore(flags);
-
-	while (!cpu_online(cpu)) {
-		cpu_relax();
-		touch_nmi_watchdog();
+			while (!cpu_online(cpu)) {
+				cpu_relax();
+				touch_nmi_watchdog();
+			}
+			//BUG_ON(!cpu_online(cpu));
+		}
+		i++;
 	}
 
 	return 0;

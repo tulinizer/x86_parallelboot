@@ -536,7 +536,7 @@ void __init smp_init(void)
 		if (num_online_cpus() >= setup_max_cpus)
 			break;
 		if (!cpu_online(cpu))
-			cpu_up(cpu);
+			cpu_parallel_up(cpu);
 	}
 
 	/* Any cleanup work */

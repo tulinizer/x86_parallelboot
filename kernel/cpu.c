@@ -472,6 +472,143 @@ out:
 }
 EXPORT_SYMBOL_GPL(cpu_up);
 
+/* Requires cpu_add_remove_lock to be held */
+static int _cpu_parallel_up(unsigned int cpu, int tasks_frozen)
+{
+	int ret, nr_calls = 0;
+	void *hcpu = (void *)(long)cpu;
+	unsigned long mod = tasks_frozen ? CPU_TASKS_FROZEN : 0;
+	struct task_struct *idle = NULL;
+	int error = 0;
+
+	cpu_hotplug_begin();
+
+	for_each_present_cpu(cpu) {
+		nr_calls = 0;
+		if (cpu_online(cpu)) {
+			printk(KERN_WARNING "%s: CPU %u is already online\n",
+							__func__, cpu);
+			continue;
+		}
+		if (!cpu_present(cpu)) {
+			error = -EINVAL;
+			set_cpu_present(cpu, false);
+		} else {
+			idle = idle_thread_get(cpu);
+			if (IS_ERR(idle)) {
+				error = PTR_ERR(idle);
+				set_cpu_present(cpu, false);
+			} else {
+				ret = __cpu_notify(CPU_UP_PREPARE | mod, hcpu, -1, &nr_calls);
+				if (ret) {
+					nr_calls--;
+					printk(KERN_WARNING "%s: attempt to bring up CPU %u failed\n",
+							__func__, cpu);
+					__cpu_notify(CPU_UP_CANCELED | mod, hcpu, nr_calls, NULL);
+					error = ret;
+					set_cpu_present(cpu, false);
+				}
+			}
+		}
+	}
+
+	/* Arch-specific enabling code. */
+	ret = __cpu_up(cpu, idle);
+
+	for_each_present_cpu(cpu) {
+		ret = smpboot_create_threads(cpu);
+		if (!ret) {
+			/* Wake the per cpu threads */
+			smpboot_unpark_threads(cpu);
+
+			/* Now call notifier in preparation. */
+			cpu_notify(CPU_ONLINE | mod, hcpu);
+		}
+	}
+
+	cpu_hotplug_done();
+
+	/* TODO
+	 * return error if all of the cpus failed
+	 * to come online
+	 */
+	return 0;
+}
+
+int cpu_parallel_up(unsigned int cpu)
+{
+	int err = 0;
+	int error[4] = {0, 0, 0, 0};
+	int i = 0;
+
+#ifdef	CONFIG_MEMORY_HOTPLUG
+		int nid;
+		pg_data_t	*pgdat;
+#endif
+
+		for_each_present_cpu(cpu) {
+			if (!cpu_possible(cpu)) {
+				printk(KERN_ERR "can't online cpu %d because it is not "
+					"configured as may-hotadd at boot time\n", cpu);
+#if defined(CONFIG_IA64)
+				printk(KERN_ERR "please check additional_cpus= boot "
+						"parameter\n");
+#endif
+				error[i] = -EINVAL;
+			}
+
+#ifdef	CONFIG_MEMORY_HOTPLUG
+			if (!error[i]) {
+				nid = cpu_to_node(cpu);
+				if (!node_online(nid)) {
+					err = mem_online_node(nid);
+					if (err)
+						error[i] = err;
+				}
+
+				if (!error[i]) {
+					pgdat = NODE_DATA(nid);
+					if (!pgdat) {
+						printk(KERN_ERR
+							"Can't online cpu %d due to NULL pgdat\n", cpu);
+						error[i] = -ENOMEM;
+					}
+
+					else if (pgdat->node_zonelists->_zonerefs->zone == NULL) {
+						mutex_lock(&zonelists_mutex);
+						build_all_zonelists(NULL, NULL);
+						mutex_unlock(&zonelists_mutex);
+					}
+				}
+			}
+			i++;
+		}
+#endif
+
+		cpu_maps_update_begin();
+
+		i = 0;
+		for_each_present_cpu(cpu) {
+			if (!error[i]) {
+				if (cpu_hotplug_disabled)
+					error[i] = -EBUSY;
+			}
+
+			if(error[i])
+				/* Mark the cpu as it can't get online */
+				set_cpu_present(cpu, false);
+			i++;
+		}
+
+		/* _cpu_up will be called once */
+		err = _cpu_parallel_up(cpu, 0);
+
+		cpu_maps_update_done();
+
+	return err;
+}
+EXPORT_SYMBOL_GPL(cpu_parallel_up);
+
 #ifdef CONFIG_PM_SLEEP_SMP
 static cpumask_var_t frozen_cpus;
 
